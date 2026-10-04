@@ -1,0 +1,597 @@
+import SalesInvoice from "../model/SalesInvoice.js";
+import SalesPerson from "../model/SalesPerson.js";
+
+// Helper function to build a name -> employeeId lookup map from SalesPerson database records
+const buildSalesPersonEmpIdMap = async () => {
+  const map = {};
+  try {
+    const salesPersons = await SalesPerson.find({}).lean();
+    for (const sp of salesPersons) {
+      if (!sp.employeeId) continue;
+      const empId = sp.employeeId;
+      const first = (sp.firstName || "").trim();
+      const last = (sp.lastName && sp.lastName !== "-") ? sp.lastName.trim() : "";
+
+      if (first) {
+        map[first.toLowerCase()] = empId;
+      }
+      if (first && last) {
+        map[`${first} ${last}`.toLowerCase()] = empId;
+        map[`${first}-${last}`.toLowerCase()] = empId;
+      }
+    }
+  } catch (error) {
+    console.error("Error building SalesPerson empId map:", error);
+  }
+  return map;
+};
+
+// Helper lookup to resolve empId from salesperson name string
+const resolveEmpId = (name, empIdMap) => {
+  if (!name || typeof name !== "string") return "";
+  const trimmed = name.trim().toLowerCase();
+  return empIdMap[trimmed] || "";
+};
+
+// ── Store master list (locCode → storeName) ──────────────────────────────────
+const STORE_MAP = {
+  "144": "Z-Edapally1",
+  "702": "G-Edappally",
+  "700": "SG-Trivandrum",
+  "100": "Z-Edappal",
+  "133": "Z.Perinthalmanna",
+  "122": "Z.Kottakkal",
+  "701": "G.Kottayam",
+  "703": "G.Perumbavoor",
+  "704": "G.Thrissur",
+  "706": "G.Chavakkad",
+  "712": "G.Calicut",
+  "708": "G.Vadakara",
+  "707": "G.Edappal",
+  "709": "G.Perinthalmanna",
+  "711": "G.Kottakkal",
+  "710": "G.Manjeri",
+  "705": "G.Palakkad",
+  "717": "G.Kalpetta",
+  "716": "G.Kannur",
+  "718": "G.MG Road",
+  "555": "Dappr Squad",
+  "858": "Warehouse",
+  "759": "HEAD OFFICE01",
+  "101": "Production",
+  "102": "Office",
+  "103": "WAREHOUSE",
+};
+
+/**
+ * @desc  Shoe & shirt sales summary — per store, for a given date range
+ * @route GET /api/external/shoe-sales/summary
+ * @query fromDate=YYYY-MM-DD  toDate=YYYY-MM-DD  locCode=XXX  (all optional)
+ * @access Public
+ *
+ * Tip — to replicate FTD/MTD on the frontend:
+ *   FTD  →  fromDate=today  &  toDate=today
+ *   MTD  →  fromDate=YYYY-MM-01  &  toDate=today
+ *
+ * Response shape:
+ * {
+ *   fromDate, toDate, locCode,
+ *   stores: [
+ *     {
+ *       locCode, storeName,
+ *       shoe:  { bills, qty, value },
+ *       shirt: { bills, qty, value },
+ *       mixed: { bills, qty, value },
+ *       total: { bills, qty, value }
+ *     }
+ *   ],
+ *   grandTotal: {
+ *     shoe:  { bills, qty, value },
+ *     shirt: { bills, qty, value },
+ *     mixed: { bills, qty, value },
+ *     total: { bills, qty, value }
+ *   }
+ * }
+ */
+export const getShoeSalesSummary = async (req, res) => {
+  try {
+    const { fromDate, toDate, locCode } = req.query;
+
+    // ── Build query ───────────────────────────────────────────────────────────
+    const query = {
+      category:     { $nin: ["Return", "Refund", "Cancel", "refund", "cancel"] },
+      subCategory:  { $in: ["shoe sales", "shirt sales", "mixed sales"] },
+      returnStatus: { $ne: "full" },   // exclude fully-returned invoices (0 items left)
+    };
+
+    if (fromDate || toDate) {
+      query.invoiceDate = {};
+      if (fromDate) {
+        const start = new Date(fromDate);
+        start.setHours(0, 0, 0, 0);
+        query.invoiceDate.$gte = start;
+      }
+      if (toDate) {
+        const end = new Date(toDate);
+        end.setHours(23, 59, 59, 999);
+        query.invoiceDate.$lte = end;
+      }
+    }
+
+    if (locCode) query.locCode = locCode;
+
+    // ── Fetch ─────────────────────────────────────────────────────────────────
+    const invoices = await SalesInvoice.find(query).select(
+      "locCode subCategory lineItems finalTotal"
+    );
+
+    // ── Aggregate per store ───────────────────────────────────────────────────
+    const storeData = {};
+
+    for (const inv of invoices) {
+      const lc  = inv.locCode || "unknown";
+      const sub = (inv.subCategory || "").toLowerCase().trim();
+      const key = sub === "shoe sales" ? "shoe" : sub === "shirt sales" ? "shirt" : "mixed";
+      // qty = number of line item rows (matches Sales by Invoice Report page logic)
+      const qty = (inv.lineItems || []).length;
+      const val = inv.finalTotal || 0;
+
+      if (!storeData[lc]) {
+        storeData[lc] = {
+          shoe:  { bills: 0, qty: 0, value: 0 },
+          shirt: { bills: 0, qty: 0, value: 0 },
+          mixed: { bills: 0, qty: 0, value: 0 },
+        };
+      }
+
+      storeData[lc][key].bills += 1;
+      storeData[lc][key].qty   += qty;
+      storeData[lc][key].value += val;
+    }
+
+    // ── Build response ────────────────────────────────────────────────────────
+    const stores = Object.entries(storeData).map(([lc, data]) => ({
+      locCode:   lc,
+      storeName: STORE_MAP[lc] || lc,
+      shoe:  data.shoe,
+      shirt: data.shirt,
+      mixed: data.mixed,
+      total: {
+        bills: data.shoe.bills + data.shirt.bills + data.mixed.bills,
+        qty:   data.shoe.qty   + data.shirt.qty   + data.mixed.qty,
+        value: data.shoe.value + data.shirt.value + data.mixed.value,
+      },
+    }));
+
+    stores.sort((a, b) => a.storeName.localeCompare(b.storeName));
+
+    // ── Grand totals ──────────────────────────────────────────────────────────
+    const grand = {
+      shoe:  { bills: 0, qty: 0, value: 0 },
+      shirt: { bills: 0, qty: 0, value: 0 },
+      mixed: { bills: 0, qty: 0, value: 0 },
+      total: { bills: 0, qty: 0, value: 0 },
+    };
+    for (const s of stores) {
+      for (const cat of ["shoe", "shirt", "mixed"]) {
+        grand[cat].bills += s[cat].bills;
+        grand[cat].qty   += s[cat].qty;
+        grand[cat].value += s[cat].value;
+      }
+      grand.total.bills += s.total.bills;
+      grand.total.qty   += s.total.qty;
+      grand.total.value += s.total.value;
+    }
+
+    res.status(200).json({
+      fromDate:   fromDate || null,
+      toDate:     toDate   || null,
+      locCode:    locCode  || null,
+      stores,
+      grandTotal: grand,
+    });
+  } catch (error) {
+    console.error("Error fetching shoe sales summary:", error);
+    res.status(500).json({ message: "Server error", error: error.message });
+  }
+};
+
+/**
+ * @desc  Shoe & shirt sales summary — per salesperson (with per-store breakdown)
+ * @route GET /api/external/shoe-sales/by-salesperson
+ * @query fromDate=YYYY-MM-DD  toDate=YYYY-MM-DD  locCode=XXX  (all optional)
+ * @access Public
+ *
+ * Response shape:
+ * {
+ *   fromDate, toDate, locCode,
+ *   salespersons: [
+ *     {
+ *       salesperson,
+ *       shoe:  { bills, qty, value },
+ *       shirt: { bills, qty, value },
+ *       mixed: { bills, qty, value },
+ *       total: { bills, qty, value },
+ *       stores: [
+ *         {
+ *           locCode, storeName,
+ *           shoe:  { bills, qty, value },
+ *           shirt: { bills, qty, value },
+ *           mixed: { bills, qty, value },
+ *           total: { bills, qty, value }
+ *         }
+ *       ]
+ *     }
+ *   ],
+ *   grandTotal: {
+ *     shoe:  { bills, qty, value },
+ *     shirt: { bills, qty, value },
+ *     mixed: { bills, qty, value },
+ *     total: { bills, qty, value }
+ *   }
+ * }
+ */
+export const getShoeSalesBySalesPerson = async (req, res) => {
+  try {
+    const { fromDate, toDate, locCode } = req.query;
+
+    // ── Build query ─────────────────────────────────────────────────────────
+    const query = {
+      category:     { $nin: ["Return", "Refund", "Cancel", "refund", "cancel"] },
+      subCategory:  { $in: ["shoe sales", "shirt sales", "mixed sales"] },
+      returnStatus: { $ne: "full" },   // exclude fully-returned invoices (0 items left)
+    };
+
+    if (fromDate || toDate) {
+      query.invoiceDate = {};
+      if (fromDate) {
+        const start = new Date(fromDate);
+        start.setHours(0, 0, 0, 0);
+        query.invoiceDate.$gte = start;
+      }
+      if (toDate) {
+        const end = new Date(toDate);
+        end.setHours(23, 59, 59, 999);
+        query.invoiceDate.$lte = end;
+      }
+    }
+
+    if (locCode) query.locCode = locCode;
+
+    // ── Fetch ───────────────────────────────────────────────────────────────
+    const [invoices, empIdMap] = await Promise.all([
+      SalesInvoice.find(query).select(
+        "locCode subCategory salesperson lineItems finalTotal"
+      ),
+      buildSalesPersonEmpIdMap(),
+    ]);
+
+    // ── Aggregate: spData[salesperson][locCode] = { shoe, shirt, mixed } ────
+    const spData = {};
+
+    for (const inv of invoices) {
+      const sp  = (inv.salesperson || "").trim() || "Unassigned";
+      const lc  = inv.locCode || "unknown";
+      const sub = (inv.subCategory || "").toLowerCase().trim();
+      const key = sub === "shoe sales" ? "shoe" : sub === "shirt sales" ? "shirt" : "mixed";
+      const qty = (inv.lineItems || []).length;   // matches Sales by Invoice Report logic
+      const val = inv.finalTotal || 0;
+
+      // Init salesperson bucket
+      if (!spData[sp]) spData[sp] = {};
+
+      // Init store bucket inside salesperson
+      if (!spData[sp][lc]) {
+        spData[sp][lc] = {
+          shoe:  { bills: 0, qty: 0, value: 0 },
+          shirt: { bills: 0, qty: 0, value: 0 },
+          mixed: { bills: 0, qty: 0, value: 0 },
+        };
+      }
+
+      spData[sp][lc][key].bills += 1;
+      spData[sp][lc][key].qty   += qty;
+      spData[sp][lc][key].value += val;
+    }
+
+    // ── Build response ───────────────────────────────────────────────────────
+    const salespersons = Object.entries(spData).map(([sp, storeMap]) => {
+      // Build per-store array
+      const stores = Object.entries(storeMap).map(([lc, data]) => {
+        const storeTotal = {
+          bills: data.shoe.bills + data.shirt.bills + data.mixed.bills,
+          qty:   data.shoe.qty   + data.shirt.qty   + data.mixed.qty,
+          value: data.shoe.value + data.shirt.value + data.mixed.value,
+        };
+        return {
+          locCode:   lc,
+          storeName: STORE_MAP[lc] || lc,
+          shoe:  data.shoe,
+          shirt: data.shirt,
+          mixed: data.mixed,
+          total: storeTotal,
+        };
+      });
+
+      // Sort stores by storeName
+      stores.sort((a, b) => a.storeName.localeCompare(b.storeName));
+
+      // Roll up totals across all stores for this salesperson
+      const rolled = {
+        shoe:  { bills: 0, qty: 0, value: 0 },
+        shirt: { bills: 0, qty: 0, value: 0 },
+        mixed: { bills: 0, qty: 0, value: 0 },
+        total: { bills: 0, qty: 0, value: 0 },
+      };
+      for (const s of stores) {
+        for (const cat of ["shoe", "shirt", "mixed"]) {
+          rolled[cat].bills += s[cat].bills;
+          rolled[cat].qty   += s[cat].qty;
+          rolled[cat].value += s[cat].value;
+        }
+        rolled.total.bills += s.total.bills;
+        rolled.total.qty   += s.total.qty;
+        rolled.total.value += s.total.value;
+      }
+
+      const empId = resolveEmpId(sp, empIdMap);
+      return {
+        salesperson: sp,
+        employeeId: empId,
+        empId: empId,
+        shoe:  rolled.shoe,
+        shirt: rolled.shirt,
+        mixed: rolled.mixed,
+        total: rolled.total,
+        stores,
+      };
+    });
+
+    // Sort salespersons by total value descending (top performers first)
+    salespersons.sort((a, b) => b.total.value - a.total.value);
+
+    // ── Grand totals ─────────────────────────────────────────────────────────
+    const grand = {
+      shoe:  { bills: 0, qty: 0, value: 0 },
+      shirt: { bills: 0, qty: 0, value: 0 },
+      mixed: { bills: 0, qty: 0, value: 0 },
+      total: { bills: 0, qty: 0, value: 0 },
+    };
+    for (const sp of salespersons) {
+      for (const cat of ["shoe", "shirt", "mixed"]) {
+        grand[cat].bills += sp[cat].bills;
+        grand[cat].qty   += sp[cat].qty;
+        grand[cat].value += sp[cat].value;
+      }
+      grand.total.bills += sp.total.bills;
+      grand.total.qty   += sp.total.qty;
+      grand.total.value += sp.total.value;
+    }
+
+    res.status(200).json({
+      fromDate:    fromDate || null,
+      toDate:      toDate   || null,
+      locCode:     locCode  || null,
+      salespersons,
+      grandTotal:  grand,
+    });
+  } catch (error) {
+    console.error("Error fetching shoe sales by salesperson:", error);
+    res.status(500).json({ message: "Server error", error: error.message });
+  }
+};
+
+// Helper to format Date to YYYY-MM-DDTHH:mm:ss format
+const formatDate = (date) => {
+  if (!date) return "";
+  const d = new Date(date);
+  if (isNaN(d.getTime())) return "";
+  
+  // Format as YYYY-MM-DDTHH:mm:ss in local time or UTC as stored in DB
+  const pad = (num) => String(num).padStart(2, "0");
+  const year = d.getFullYear();
+  const month = pad(d.getMonth() + 1);
+  const day = pad(d.getDate());
+  const hours = pad(d.getHours());
+  const minutes = pad(d.getMinutes());
+  const seconds = pad(d.getSeconds());
+  
+  return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}`;
+};
+
+/**
+ * @desc    Get all shoe sales (bookings)
+ * @route   GET /api/external/shoe-sales/bookings
+ * @access  Public
+ */
+export const getExternalShoeBookings = async (req, res) => {
+  try {
+    const { fromDate, toDate, locCode, storeName, branch, warehouse, limit = 100, page = 1 } = req.query;
+    
+    // Filter out "Return" category and fully-returned invoices
+    const query = {
+      category:     { $nin: ["Return", "refund", "cancel", "Refund", "Cancel"] },
+      returnStatus: { $ne: "full" },   // exclude fully-returned invoices (0 items left)
+    };
+
+    if (fromDate || toDate) {
+      query.invoiceDate = {};
+      if (fromDate) {
+        query.invoiceDate.$gte = new Date(fromDate);
+      }
+      if (toDate) {
+        query.invoiceDate.$lte = new Date(toDate);
+      }
+    }
+
+    if (locCode) {
+      query.locCode = locCode;
+    }
+
+    const selectedStore = storeName || branch || warehouse;
+    if (selectedStore) {
+      query.$or = [
+        { branch: selectedStore },
+        { warehouse: selectedStore }
+      ];
+    }
+
+    const parsedLimit = Math.min(Math.max(parseInt(limit) || 100, 1), 1000);
+    const parsedPage = Math.max(parseInt(page) || 1, 1);
+    const skip = (parsedPage - 1) * parsedLimit;
+
+    const [invoices, empIdMap] = await Promise.all([
+      SalesInvoice.find(query)
+        .sort({ invoiceDate: -1 })
+        .skip(skip)
+        .limit(parsedLimit),
+      buildSalesPersonEmpIdMap(),
+    ]);
+
+    const formattedBookings = invoices.map(invoice => {
+      const totalQuantity = invoice.lineItems ? invoice.lineItems.reduce((sum, item) => sum + (item.quantity || 0), 0) : 0;
+      
+      const items = (invoice.lineItems || []).map(item => {
+        let itemCategory = item.category || (item.itemData && item.itemData.category);
+        if (!itemCategory) {
+          const itemNameLower = (item.item || "").toLowerCase();
+          const itemSkuLower = (item.itemSku || "").toLowerCase();
+          if (itemNameLower.includes("shirt") || itemNameLower.includes("t-shirt") || itemSkuLower.includes("shirt")) {
+            itemCategory = "shirt";
+          } else if (itemNameLower.includes("shoe") || itemNameLower.includes("footwear") || itemSkuLower.includes("shoe")) {
+            itemCategory = "shoe";
+          } else {
+            itemCategory = "other";
+          }
+        }
+        return {
+          itemName: item.item,
+          sku: item.itemSku || "",
+          category: itemCategory,
+          quantity: item.quantity || 0,
+          rate: item.rate || 0,
+          amount: item.amount || 0,
+          costPrice: item.itemData?.costPrice || 0
+        };
+      });
+
+      const empId = resolveEmpId(invoice.salesperson, empIdMap);
+      return {
+        invoiceNo: invoice.invoiceNumber,
+        customerName: invoice.customer,
+        phoneNo: invoice.customerPhone || "",
+        billedDate: formatDate(invoice.invoiceDate),
+        category: invoice.subCategory || "",
+        value: invoice.finalTotal || 0,
+        quantity: totalQuantity,
+        salesPerson: invoice.salesperson || "",
+        employeeId: empId,
+        empId: empId,
+        items
+      };
+    });
+
+    res.status(200).json(formattedBookings);
+  } catch (error) {
+    console.error("Error fetching external shoe bookings:", error);
+    res.status(500).json({ message: "Server error", error: error.message });
+  }
+};
+
+/**
+ * @desc    Get all shoe returns
+ * @route   GET /api/external/shoe-sales/returns
+ * @access  Public
+ */
+export const getExternalShoeReturns = async (req, res) => {
+  try {
+    const { fromDate, toDate, locCode, storeName, branch, warehouse, limit = 100, page = 1 } = req.query;
+
+    // Filter only "Return" category (and refund/cancel if they represent returns)
+    const query = {
+      category: { $in: ["Return", "refund", "cancel", "Refund", "Cancel"] }
+    };
+
+    if (fromDate || toDate) {
+      query.invoiceDate = {};
+      if (fromDate) {
+        query.invoiceDate.$gte = new Date(fromDate);
+      }
+      if (toDate) {
+        query.invoiceDate.$lte = new Date(toDate);
+      }
+    }
+
+    if (locCode) {
+      query.locCode = locCode;
+    }
+
+    const selectedStore = storeName || branch || warehouse;
+    if (selectedStore) {
+      query.$or = [
+        { branch: selectedStore },
+        { warehouse: selectedStore }
+      ];
+    }
+
+    const parsedLimit = Math.min(Math.max(parseInt(limit) || 100, 1), 1000);
+    const parsedPage = Math.max(parseInt(page) || 1, 1);
+    const skip = (parsedPage - 1) * parsedLimit;
+
+    const [invoices, empIdMap] = await Promise.all([
+      SalesInvoice.find(query)
+        .sort({ invoiceDate: -1 })
+        .skip(skip)
+        .limit(parsedLimit),
+      buildSalesPersonEmpIdMap(),
+    ]);
+
+    const formattedReturns = invoices.map(invoice => {
+      const totalQuantity = invoice.lineItems ? invoice.lineItems.reduce((sum, item) => sum + (item.quantity || 0), 0) : 0;
+      
+      const items = (invoice.lineItems || []).map(item => {
+        let itemCategory = item.category || (item.itemData && item.itemData.category);
+        if (!itemCategory) {
+          const itemNameLower = (item.item || "").toLowerCase();
+          const itemSkuLower = (item.itemSku || "").toLowerCase();
+          if (itemNameLower.includes("shirt") || itemNameLower.includes("t-shirt") || itemSkuLower.includes("shirt")) {
+            itemCategory = "shirt";
+          } else if (itemNameLower.includes("shoe") || itemNameLower.includes("footwear") || itemSkuLower.includes("shoe")) {
+            itemCategory = "shoe";
+          } else {
+            itemCategory = "other";
+          }
+        }
+        return {
+          itemName: item.item,
+          sku: item.itemSku || "",
+          category: itemCategory,
+          quantity: item.quantity || 0,
+          rate: item.rate || 0,
+          amount: item.amount || 0,
+          costPrice: item.itemData?.costPrice || 0
+        };
+      });
+
+      const empId = resolveEmpId(invoice.salesperson, empIdMap);
+      return {
+        invoiceNo: invoice.invoiceNumber,
+        customerName: invoice.customer,
+        phoneNo: invoice.customerPhone || "",
+        billedReturnedDate: formatDate(invoice.invoiceDate),
+        category: invoice.subCategory || "",
+        value: invoice.finalTotal || 0,
+        quantity: totalQuantity,
+        salesPerson: invoice.salesperson || "",
+        employeeId: empId,
+        empId: empId,
+        items
+      };
+    });
+
+    res.status(200).json(formattedReturns);
+  } catch (error) {
+    console.error("Error fetching external shoe returns:", error);
+    res.status(500).json({ message: "Server error", error: error.message });
+  }
+};
